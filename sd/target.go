@@ -1,0 +1,315 @@
+package sd
+
+import (
+	"fmt"
+	"io/fs"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+)
+
+// 对应一个进程
+//
+// "__process_pid__":       spid,
+// "__meta_process_cwd":    cwd,
+// "__meta_process_exe":    exe,
+// "__meta_process_comm":   string(comm),
+// "__meta_process_cgroup": string(cgroup),
+type DiscoveryTarget map[string]string
+
+func (t *DiscoveryTarget) DebugString() string {
+	var b strings.Builder
+	b.WriteByte('{')
+	for k, v := range *t {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(v)
+		b.WriteByte(',')
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
+const (
+	labelContainerID    = "__container_id__"
+	labelPID            = "__process_pid__"
+	labelServiceName    = "service_name"
+	labelServiceNameK8s = "__meta_kubernetes_pod_annotation_pyroscope_io_service_name"
+	metricValue         = "process_cpu"
+)
+
+type Target struct {
+	// todo make keep it a map until Append happens
+	labels                labels.Labels
+	serviceName           string
+	fingerprint           uint64
+	fingerprintCalculated bool
+}
+
+// 创建Target，初始化labels和servicesName
+//
+// cid不为零，则添加进labels
+// pid不为零，则添加进labels
+// target提供其他labels和serviceName
+func NewTarget(cid containerID, pid uint32, target DiscoveryTarget) *Target {
+	serviceName := target[labelServiceName]
+	if serviceName == "" {
+		serviceName = inferServiceName(target)
+	}
+
+	// lset 为target的标签初始化表，规定有以下标签：
+	// labelContainerID    = "__container_id__"
+	// labelPID            = "__process_pid__"
+	// labelServiceName    = "service_name"
+	// labelServiceNameK8s = "__meta_kubernetes_pod_annotation_pyroscope_io_service_name"
+	// MetricName   = "__name__"
+	// 默认的 MetricName 在其中对应的值为 metricValue = "process_cpu"
+	lset := make(map[string]string, len(target))
+	for k, v := range target {
+		if strings.HasPrefix(k, model.ReservedLabelPrefix) && k != labels.MetricName {
+			continue
+		}
+		lset[k] = v
+	}
+	if lset[labels.MetricName] == "" {
+		lset[labels.MetricName] = metricValue
+	}
+	if lset[labelServiceName] == "" {
+		lset[labelServiceName] = serviceName
+	}
+	if cid != "" {
+		lset[labelContainerID] = string(cid)
+	}
+	if pid != 0 {
+		lset[labelPID] = strconv.Itoa(int(pid))
+	}
+	return &Target{
+		// 将map展开为label的list
+		labels:      labels.FromMap(lset),
+		serviceName: serviceName,
+	}
+}
+
+func (t *Target) ServiceName() string {
+	return t.serviceName
+}
+
+// 获取k8s或docker的容器名
+func inferServiceName(target DiscoveryTarget) string {
+	k8sServiceName := target[labelServiceNameK8s]
+	if k8sServiceName != "" {
+		return k8sServiceName
+	}
+	k8sNamespace := target["__meta_kubernetes_namespace"]
+	k8sContainer := target["__meta_kubernetes_pod_container_name"]
+	if k8sNamespace != "" && k8sContainer != "" {
+		return fmt.Sprintf("ebpf/%s/%s", k8sNamespace, k8sContainer)
+	}
+	dockerContainer := target["__meta_docker_container_name"]
+	if dockerContainer != "" {
+		return dockerContainer
+	}
+	if swarmService := target["__meta_dockerswarm_container_label_service_name"]; swarmService != "" {
+		return swarmService
+	}
+	if swarmService := target["__meta_dockerswarm_service_name"]; swarmService != "" {
+		return swarmService
+	}
+	return "unspecified"
+}
+
+func (t *Target) Labels() (uint64, labels.Labels) {
+	if !t.fingerprintCalculated {
+		t.fingerprint = t.labels.Hash()
+		t.fingerprintCalculated = true
+	}
+	return t.fingerprint, t.labels
+}
+
+func (t *Target) String() string {
+	return t.labels.String()
+}
+
+type containerID string
+
+type TargetFinder interface {
+	FindTarget(pid uint32) *Target
+	RemoveDeadPID(pid uint32)
+	DebugInfo() []string
+	Update(args TargetsOptions)
+}
+type TargetsOptions struct {
+	Targets            []DiscoveryTarget
+	TargetsOnly        bool
+	DefaultTarget      DiscoveryTarget
+	ContainerCacheSize int
+}
+
+type targetFinder struct {
+	l          log.Logger
+	cid2target map[containerID]*Target
+	pid2target map[uint32]*Target
+
+	// todo make it never evict during a reset
+	containerIDCache *lru.Cache[uint32, containerID]
+	defaultTarget    *Target
+	fs               fs.FS
+
+	sync sync.Mutex
+}
+
+// 创建目标查找器并设置所有成员
+func NewTargetFinder(fs fs.FS, l log.Logger, options TargetsOptions) (TargetFinder, error) {
+	containerIDCache, err := lru.New[uint32, containerID](options.ContainerCacheSize)
+	if err != nil {
+		return nil, fmt.Errorf("containerIDCache create: %w", err)
+	}
+	res := &targetFinder{
+		l:                l,
+		containerIDCache: containerIDCache,
+		fs:               fs,
+	}
+	res.setTargets(options)
+	return res, nil
+}
+
+// 根据pid查找目标，找不到则返回默认目标
+func (tf *targetFinder) FindTarget(pid uint32) *Target {
+	tf.sync.Lock()
+	defer tf.sync.Unlock()
+	res := tf.findTarget(pid)
+	if res != nil {
+		return res
+	}
+	return tf.defaultTarget
+}
+
+func (tf *targetFinder) RemoveDeadPID(pid uint32) {
+	tf.sync.Lock()
+	defer tf.sync.Unlock()
+	tf.containerIDCache.Remove(pid)
+	delete(tf.pid2target, pid)
+}
+
+// 更新目标和容器缓存大小
+func (tf *targetFinder) Update(args TargetsOptions) {
+	tf.sync.Lock()
+	defer tf.sync.Unlock()
+	tf.setTargets(args)
+	tf.resizeContainerIDCache(args.ContainerCacheSize)
+}
+
+// 由目标选项转换为目标查找器的进程目标和容器目标
+func (tf *targetFinder) setTargets(opts TargetsOptions) {
+	_ = level.Debug(tf.l).Log("msg", "set targets", "count", len(opts.Targets))
+	containerID2Target := make(map[containerID]*Target)
+	pid2Target := make(map[uint32]*Target)
+	for _, target := range opts.Targets {
+		// 从目标发现器获取pid
+		if pid := pidFromTarget(target); pid != 0 {
+			t := NewTarget("", pid, target)
+			pid2Target[pid] = t
+		} else if cid := containerIDFromTarget(target); cid != "" {
+			t := NewTarget(cid, 0, target)
+			containerID2Target[cid] = t
+		}
+	}
+	if len(opts.Targets) > 0 && len(containerID2Target) == 0 && len(pid2Target) == 0 {
+		_ = level.Warn(tf.l).Log("msg", "No targets found")
+	}
+	tf.cid2target = containerID2Target
+	tf.pid2target = pid2Target
+	// ？
+	// TargetsOnly为真，则目标查找器没有默认Target
+	if opts.TargetsOnly {
+		tf.defaultTarget = nil
+	} else {
+		// 否则，由目标选项的默认目标设置
+		t := NewTarget("", 0, opts.DefaultTarget)
+		tf.defaultTarget = t
+	}
+	_ = level.Debug(tf.l).Log("msg", "created targets", "count", len(tf.cid2target))
+}
+
+func (tf *targetFinder) findTarget(pid uint32) *Target {
+	if target, ok := tf.pid2target[pid]; ok {
+		return target
+	}
+	cid, ok := tf.containerIDCache.Get(pid)
+	if ok {
+		return tf.cid2target[cid]
+	}
+
+	cid = tf.getContainerIDFromPID(pid)
+	tf.containerIDCache.Add(pid, cid)
+	return tf.cid2target[cid]
+}
+
+func (tf *targetFinder) resizeContainerIDCache(size int) {
+	tf.containerIDCache.Resize(size)
+}
+
+func (tf *targetFinder) DebugInfo() []string {
+	tf.sync.Lock()
+	defer tf.sync.Unlock()
+
+	debugTargets := make([]string, 0, len(tf.cid2target))
+	for _, target := range tf.cid2target {
+		_, ls := target.Labels()
+		debugTargets = append(debugTargets, ls.String())
+	}
+	return debugTargets
+}
+
+func (tf *targetFinder) Targets() []*Target {
+	tf.sync.Lock()
+	defer tf.sync.Unlock()
+
+	res := make([]*Target, 0, len(tf.cid2target))
+	for _, target := range tf.cid2target {
+		res = append(res, target)
+	}
+	return res
+}
+
+// 从一个target中获取pid
+//
+// 查找失败返回0
+func pidFromTarget(target DiscoveryTarget) uint32 {
+	t, ok := target[labelPID]
+	if !ok {
+		return 0
+	}
+	var pid uint64
+	var err error
+	pid, err = strconv.ParseUint(t, 10, 32)
+	if err != nil {
+		return 0
+	}
+	return uint32(pid)
+}
+
+func containerIDFromTarget(target DiscoveryTarget) containerID {
+	cid, ok := target[labelContainerID]
+	if ok && cid != "" {
+		return containerID(cid)
+	}
+	cid, ok = target["__meta_kubernetes_pod_container_id"]
+	if ok && cid != "" {
+		return getContainerIDFromK8S(cid)
+	}
+	cid, ok = target["__meta_docker_container_id"]
+	if ok && cid != "" {
+		return containerID(cid)
+	}
+	if cid, ok = target["__meta_dockerswarm_task_container_id"]; ok && cid != "" {
+		return containerID(cid)
+	}
+	return ""
+}
